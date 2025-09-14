@@ -1,4 +1,6 @@
-import streamlit as st
+
+from flask import Flask, request, jsonify, session, render_template
+from flask_session import Session
 import os
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -8,24 +10,25 @@ from langchain_community.document_loaders import PyPDFLoader
 from dotenv import load_dotenv
 
 # ===============================
+# FLASK APP CONFIG
+# ===============================
+app = Flask(__name__)
+app.secret_key = "supersecretkey"
+app.config["SESSION_TYPE"] = "filesystem"
+Session(app)
+
+# ===============================
 # LOAD ENV
 # ===============================
-load_dotenv(override=True) 
+load_dotenv(override=True)
 api_key = os.getenv("OPENAI_API_KEY")
 
 if not api_key:
-    st.error("❌ OPENAI_API_KEY not found in .env file")
-    st.stop()
-
-# ===============================
-# CONFIG
-# ===============================
-st.set_page_config(page_title="Data Science Q&A Bot", page_icon="🤖", layout="wide")
+    raise ValueError("❌ OPENAI_API_KEY not found in environment variables!")
 
 # ===============================
 # LOAD PDF + VECTORSTORE
 # ===============================
-@st.cache_resource
 def load_vectorstore():
     loader = PyPDFLoader("Data Science.pdf")
     docs = loader.load()
@@ -42,7 +45,7 @@ retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k
 # ===============================
 # LLM + PROMPT
 # ===============================
-llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7, streaming=True)
+llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7)
 
 prompt = PromptTemplate(
     template="""
@@ -57,61 +60,76 @@ prompt = PromptTemplate(
 )
 
 # ===============================
-# SIDEBAR FOR CHAT HISTORY
+# ROUTES
 # ===============================
-with st.sidebar:
-    st.title("💬 Chat History")
 
-    # Initialize chat storage
-    if "chats" not in st.session_state:
-        st.session_state.chats = {"Default Chat": []}
-        st.session_state.current_chat = "Default Chat"
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-    # New chat button
-    if st.button("➕ New Chat"):
-        new_name = f"Chat {len(st.session_state.chats) + 1}"
-        st.session_state.chats[new_name] = []
-        st.session_state.current_chat = new_name
+@app.route("/chats", methods=["GET"])
+def get_chats():
+    """Return list of available chats"""
+    if "chats" not in session:
+        session["chats"] = {"Default Chat": []}
+        session["current_chat"] = "Default Chat"
+    return jsonify({
+        "chats": list(session["chats"].keys()),
+        "current": session["current_chat"]
+    })
 
-    # Select chat
-    chat_names = list(st.session_state.chats.keys())
-    selected_chat = st.radio("Select Chat", chat_names, index=chat_names.index(st.session_state.current_chat))
-    st.session_state.current_chat = selected_chat
+@app.route("/new_chat", methods=["POST"])
+def new_chat():
+    """Create a new chat"""
+    if "chats" not in session:
+        session["chats"] = {"Default Chat": []}
+    new_name = f"Chat {len(session['chats']) + 1}"
+    session["chats"][new_name] = []
+    session["current_chat"] = new_name
+    session.modified = True
+    return jsonify({"new_chat": new_name})
 
-# ===============================
-# MAIN CHAT UI
-# ===============================
-st.title("🤖 Data Science Q&A Chatbot")
-st.write("Ask questions about the Data Science/AI/ML.")
+@app.route("/switch_chat", methods=["POST"])
+def switch_chat():
+    """Switch to another chat"""
+    chat_name = request.json.get("chat")
+    if chat_name in session.get("chats", {}):
+        session["current_chat"] = chat_name
+        session.modified = True
+        return jsonify({"switched": chat_name})
+    return jsonify({"error": "Chat not found"}), 400
 
-# Get current chat
-messages = st.session_state.chats[st.session_state.current_chat]
+@app.route("/chat", methods=["POST"])
+def chat():
+    """Send a message in the current chat"""
+    user_question = request.json.get("question", "").strip()
+    if not user_question:
+        return jsonify({"error": "Question is required"}), 400
 
-# Display chat history
-for msg in messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    if "chats" not in session:
+        session["chats"] = {"Default Chat": []}
+        session["current_chat"] = "Default Chat"
 
-# User input
-if user_question := st.chat_input("Ask a question..."):
-    messages.append({"role": "user", "content": user_question})
-    with st.chat_message("user"):
-        st.markdown(user_question)
+    current_chat = session["current_chat"]
 
     # Retrieve docs
     retrieved_docs = retriever.invoke(user_question)
     context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
     final_prompt = prompt.invoke({"context": context_text, "question": user_question})
+    response = llm.invoke(final_prompt)
+    response_text = response.content
 
-    # Stream assistant response
-    with st.chat_message("assistant"):
-        response_text = ""
-        response_stream = llm.stream(final_prompt)
-        placeholder = st.empty()
-        for chunk in response_stream:
-            response_text += chunk.content  # ✅ Fix: use .content
-            placeholder.markdown(response_text + "▌")
-        placeholder.markdown(response_text)
+    # Save chat history
+    session["chats"][current_chat].append({"role": "user", "content": user_question})
+    session["chats"][current_chat].append({"role": "assistant", "content": response_text})
+    session.modified = True
 
-    messages.append({"role": "assistant", "content": response_text})
+    return jsonify({
+        "answer": response_text,
+        "history": session["chats"][current_chat]
+    })
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=True)
